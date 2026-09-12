@@ -3,15 +3,6 @@
 import { RefreshCw } from "lucide-react";
 import type { FaceData } from "@/lib/types";
 
-function Angle({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="flex flex-col rounded bg-slate-900 p-2">
-      <span className="text-slate-500">{label}</span>
-      <span className="font-mono text-slate-300">{value.toFixed(1)}°</span>
-    </div>
-  );
-}
-
 export default function TelemetryPanel({ faces }: { faces: FaceData[] }) {
   if (faces.length === 0) {
     return (
@@ -28,11 +19,6 @@ export default function TelemetryPanel({ faces }: { faces: FaceData[] }) {
   return (
     <div className="flex flex-col gap-6 overflow-y-auto pr-2 custom-scrollbar">
       {faces.map((face, index) => {
-        const lookingDirect =
-          face.pitch >= -15 &&
-          face.pitch <= 15 &&
-          face.yaw >= -15 &&
-          face.yaw <= 15;
         return (
           <div
             key={`tel-${index}`}
@@ -66,30 +52,83 @@ export default function TelemetryPanel({ faces }: { faces: FaceData[] }) {
                   {(face.confidence * 100).toFixed(0)}%
                 </span>
               </div>
-              <div className="flex justify-between">
-                <span>Regard direct</span>
-                <span
-                  className={`font-bold ${
-                    lookingDirect ? "text-emerald-400" : "text-rose-400"
-                  }`}
-                >
-                  {lookingDirect ? "Oui" : "Non (regarde ailleurs)"}
-                </span>
-              </div>
             </div>
 
-            <div className="border-t border-slate-700/50 pt-2">
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Angles de tête (Azure)
-              </p>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <Angle label="Pitch (haut/bas)" value={face.pitch} />
-                <Angle label="Yaw (gauche/droite)" value={face.yaw} />
-                <div className="col-span-2">
-                  <Angle label="Roll (inclinaison)" value={face.roll} />
+            {/* Attributs Azure */}
+            {(face.glasses && face.glasses !== "NoGlasses") ||
+            (face.mask && face.mask.type !== "noMask") ? (
+              <div className="mt-1 flex flex-col gap-2 border-t border-slate-700/50 pt-3 text-xs text-slate-400">
+                {face.glasses && face.glasses !== "NoGlasses" && (
+                  <div className="flex justify-between">
+                    <span>Lunettes</span>
+                    <span className="font-medium text-indigo-400">
+                      {face.glasses}
+                    </span>
+                  </div>
+                )}
+                {face.mask && face.mask.type !== "noMask" && (
+                  <div className="flex justify-between">
+                    <span>Masque</span>
+                    <span className="font-medium text-emerald-400">
+                      {face.mask.type}
+                      {face.mask.nose_and_mouth_covered ? " (Nez/Bouche)" : ""}
+                    </span>
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            {/* Qualité de l'image (Azure) */}
+            {face.quality && (
+              <div className="mt-1 flex flex-col gap-2 border-t border-slate-700/50 pt-3 text-xs">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-400">Qualité de capture</span>
+                  <span className={`font-medium ${face.quality.is_sufficient_quality ? "text-emerald-400" : "text-amber-500"}`}>
+                    {face.quality.is_sufficient_quality ? "Optimale" : "Insuffisante"}
+                  </span>
+                </div>
+                
+                {face.quality.issues.length > 0 && (
+                  <ul className="list-disc pl-4 text-amber-500/80">
+                    {face.quality.issues.map((issue, idx) => (
+                      <li key={idx}>{issue}</li>
+                    ))}
+                  </ul>
+                )}
+                
+                <div className="flex flex-col gap-1 mt-1 text-[10px] text-slate-500">
+                  <div className="flex justify-between">
+                    <span>Flou</span>
+                    <span>{face.quality.metrics.blur?.level}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Exposition</span>
+                    <span>{face.quality.metrics.exposure?.level}</span>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
+
+            {/* Démographie et Émotions (DeepFace) */}
+            {face.demographics && (
+              <div className="mt-1 flex flex-col gap-2 border-t border-slate-700/50 pt-3 text-xs">
+                <span className="text-slate-400">Analyse DeepFace</span>
+                <div className="flex flex-col gap-1">
+                  <div className="flex justify-between">
+                    <span>Âge estimé</span>
+                    <span className="font-medium text-cyan-400">{face.demographics.age} ans</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Genre</span>
+                    <span className="font-medium text-pink-400">{face.demographics.gender}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Émotion dominante</span>
+                    <span className="font-medium text-amber-400 capitalize">{face.demographics.emotion}</span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         );
       })}

@@ -1,11 +1,12 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import Webcam from "react-webcam";
-import { Activity, Cpu, History, Settings, Users, Zap } from "lucide-react";
+import Link from "next/link";
+import { Activity, Cpu, History, Pause, Play, ScanFace, Settings, Users, Video, Zap } from "lucide-react";
 
 import { api } from "@/lib/api";
-import type { FaceData, RecognitionEvent, ReferenceFace } from "@/lib/types";
+import type { FaceData, IpCameraConfig, RecognitionEvent, ReferenceFace } from "@/lib/types";
 import { ToastProvider, useToast } from "@/components/Toast";
 import CameraView from "@/components/CameraView";
 import TelemetryPanel from "@/components/TelemetryPanel";
@@ -14,6 +15,34 @@ import ReferencesPanel from "@/components/ReferencesPanel";
 import SettingsPanel from "@/components/SettingsPanel";
 
 type Tab = "telemetry" | "history" | "references" | "settings";
+
+const IP_CAMERA_KEY = "ipCameraConfig";
+const DEFAULT_IP_CAMERA_URL = "http://192.168.1.43/image/jpeg.cgi";
+const LEGACY_IP_CAMERA_URL = "http://192.168.1.100/image/jpeg.cgi";
+const DEFAULT_IP_CAMERA: IpCameraConfig = {
+  enabled: false,
+  url: DEFAULT_IP_CAMERA_URL,
+};
+
+function subscribeIpCamera(onChange: () => void) {
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key === IP_CAMERA_KEY || event.key === null) onChange();
+  };
+  window.addEventListener("storage", handleStorage);
+  return () => window.removeEventListener("storage", handleStorage);
+}
+
+function getIpCameraSnapshot() {
+  try {
+    return localStorage.getItem(IP_CAMERA_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function getServerIpCameraSnapshot() {
+  return null;
+}
 
 const TABS: { id: Tab; label: string; icon: typeof Cpu }[] = [
   { id: "telemetry", label: "Télémétrie", icon: Cpu },
@@ -30,6 +59,7 @@ function Dashboard() {
 
   const [faces, setFaces] = useState<FaceData[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisSummary, setAnalysisSummary] = useState<string | null>(null);
   const [cameraSize, setCameraSize] = useState({ width: 0, height: 0 });
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
 
@@ -37,8 +67,37 @@ function Dashboard() {
   const [references, setReferences] = useState<ReferenceFace[]>([]);
   const [events, setEvents] = useState<RecognitionEvent[]>([]);
 
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false);
   const [intervalMs, setIntervalMs] = useState(3000);
+
+  const storedIpCamera = useSyncExternalStore(
+    subscribeIpCamera, getIpCameraSnapshot, getServerIpCameraSnapshot,
+  );
+  const ipCamera = useMemo<IpCameraConfig>(() => {
+    try {
+      const config = JSON.parse(storedIpCamera ?? "null");
+      if (
+        config && typeof config.enabled === "boolean" && typeof config.url === "string" &&
+        (config.username === undefined || typeof config.username === "string") &&
+        (config.password === undefined || typeof config.password === "string")
+      ) {
+        return config.url === LEGACY_IP_CAMERA_URL
+          ? { ...config, url: DEFAULT_IP_CAMERA_URL }
+          : config;
+      }
+    } catch {}
+    return DEFAULT_IP_CAMERA;
+  }, [storedIpCamera]);
+  const [ipCameraImage, setIpCameraImage] = useState<string | null>(null);
+
+  const handleIpCameraChange = (config: IpCameraConfig) => {
+    try {
+      localStorage.setItem(IP_CAMERA_KEY, JSON.stringify(config));
+      window.dispatchEvent(new StorageEvent("storage", { key: IP_CAMERA_KEY }));
+    } catch {
+      notify("Impossible de sauvegarder la configuration de la camera.", "error");
+    }
+  };
 
   // --- Santé du backend ---
   const checkHealth = useCallback(async () => {
@@ -47,6 +106,9 @@ function Dashboard() {
       setBackendOnline(true);
       if (!h.azure_configured) {
         notify("Azure Face API non configuré côté backend.", "error");
+      }
+      if (!h.deepface_available) {
+        notify("Le moteur DeepFace est indisponible côté backend.", "error");
       }
     } catch {
       setBackendOnline(false);
@@ -114,34 +176,63 @@ function Dashboard() {
 
   // --- Boucle de capture (anti-empilement) ---
   const captureAndAnalyze = useCallback(async () => {
-    if (!webcamRef.current || inFlightRef.current) return;
-    const imageSrc = webcamRef.current.getScreenshot();
-    if (!imageSrc) return;
+    if (inFlightRef.current) return;
+    setAnalysisSummary(null);
 
-    inFlightRef.current = true;
-    setIsAnalyzing(true);
+    let imageSrc: string | null = null;
+
+    if (ipCamera.enabled) {
+      if (!ipCamera.url) return;
+      inFlightRef.current = true;
+      setIsAnalyzing(true);
+      try {
+        const res = await api.proxyCamera(ipCamera.url, ipCamera.username, ipCamera.password);
+        imageSrc = res.image;
+        setIpCameraImage(imageSrc);
+      } catch (err) {
+        notify(`Caméra IP: ${(err as Error).message}`, "error");
+        setRunning(false);
+        setFaces([]);
+        inFlightRef.current = false;
+        setIsAnalyzing(false);
+        return;
+      }
+    } else {
+      imageSrc = webcamRef.current?.getScreenshot() ?? null;
+      if (!imageSrc) {
+        setRunning(false);
+        notify("La caméra n'est pas encore disponible.", "error");
+        return;
+      }
+      inFlightRef.current = true;
+      setIsAnalyzing(true);
+    }
+
     try {
       const data = await api.analyzeFace(imageSrc);
       // Filtre anti-faux-positifs : ignore les visages trop petits par rapport
       // au cadre (arrière-plan, TV, reflets). Seuil : 6 % de la largeur.
       const w = cameraSizeRef.current.width;
       const filtered = (data.faces || []).filter(
-        (f) => w === 0 || f.faceRectangle.width / w >= 0.06,
+        (f) => w === 0 || f.faceRectangle.width / w >= 0.02,
       );
       setFaces(filtered);
+      setAnalysisSummary(filtered.length === 0 ? "Aucun visage détecté" : `${filtered.length} visage(s) détecté(s)`);
       setBackendOnline(true);
       // Un nouveau visage vient d'être auto-enrôlé : rafraîchit la liste.
       if (filtered.some((f) => f.system_action === "Auto-enrôlé")) {
         void loadReferences();
       }
     } catch (err) {
-      setBackendOnline(false);
+      setRunning(false);
+      setFaces([]);
+      void checkHealth();
       notify(`Analyse : ${(err as Error).message}`, "error");
     } finally {
       inFlightRef.current = false;
       setIsAnalyzing(false);
     }
-  }, [notify, loadReferences]);
+  }, [notify, loadReferences, ipCamera, checkHealth]);
 
   // Au montage : santé + données initiales (récupération asynchrone légitime,
   // les setState surviennent après await — pas de rendu en cascade synchrone).
@@ -163,9 +254,18 @@ function Dashboard() {
     return () => clearInterval(id);
   }, [loadHistory]);
 
-  const handleVideoLoad = (e: React.SyntheticEvent<HTMLVideoElement>) => {
-    const v = e.currentTarget;
-    const size = { width: v.videoWidth, height: v.videoHeight };
+  const handleVideoLoad = (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
+    const el = e.currentTarget;
+    let width = 0;
+    let height = 0;
+    if ("videoWidth" in el) {
+      width = (el as HTMLVideoElement).videoWidth;
+      height = (el as HTMLVideoElement).videoHeight;
+    } else {
+      width = (el as HTMLImageElement).naturalWidth;
+      height = (el as HTMLImageElement).naturalHeight;
+    }
+    const size = { width, height };
     cameraSizeRef.current = size;
     setCameraSize(size);
   };
@@ -191,7 +291,10 @@ function Dashboard() {
             </div>
           </div>
 
-          <div className="flex items-center gap-3 text-sm font-medium">
+          <div className="flex flex-wrap items-center gap-3 text-sm font-medium">
+            <Link href="/video" prefetch={false} className="flex min-h-11 items-center gap-2 text-slate-300 hover:text-white">
+              <Video className="h-4 w-4" aria-hidden="true" /> Vidéo
+            </Link>
             <div className="flex items-center gap-2 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-2">
               <span
                 className={`h-2 w-2 rounded-full ${
@@ -223,6 +326,28 @@ function Dashboard() {
           </div>
         </header>
 
+        <div className="flex flex-wrap items-center gap-3" aria-label="Commandes d'analyse">
+          <button
+            type="button"
+            onClick={() => void captureAndAnalyze()}
+            disabled={isAnalyzing || running || backendOnline !== true}
+            className="flex min-h-11 items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <ScanFace className="h-4 w-4" aria-hidden="true" /> Analyser une image
+          </button>
+          <button
+            type="button"
+            onClick={() => setRunning((current) => !current)}
+            disabled={!running && backendOnline !== true}
+            aria-pressed={running}
+            className="flex min-h-11 items-center gap-2 rounded-lg border border-slate-600 px-4 py-2 text-sm text-slate-200 hover:bg-slate-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {running ? <Pause className="h-4 w-4" aria-hidden="true" /> : <Play className="h-4 w-4" aria-hidden="true" />}
+            {running ? "Mettre en pause" : "Analyse continue"}
+          </button>
+          <span role="status" className="text-sm text-slate-300">{analysisSummary}</span>
+        </div>
+
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
           <div className="lg:col-span-2">
             <CameraView
@@ -231,6 +356,8 @@ function Dashboard() {
               cameraSize={cameraSize}
               onVideoLoad={handleVideoLoad}
               isAnalyzing={isAnalyzing}
+              useIpCamera={ipCamera.enabled}
+              ipCameraImage={ipCameraImage}
             />
           </div>
 
@@ -276,6 +403,8 @@ function Dashboard() {
                   onIntervalChange={setIntervalMs}
                   running={running}
                   onToggleRunning={() => setRunning((r) => !r)}
+                  ipCamera={ipCamera}
+                  onIpCameraChange={handleIpCameraChange}
                 />
               )}
             </div>

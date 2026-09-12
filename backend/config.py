@@ -59,8 +59,8 @@ class Settings:
     AUTO_ENROLL_PITCH_MAX: float = _get_float("AUTO_ENROLL_PITCH_MAX", 8.0)
     AUTO_ENROLL_YAW_MAX: float = _get_float("AUTO_ENROLL_YAW_MAX", 8.0)
     AUTO_ENROLL_ROLL_MAX: float = _get_float("AUTO_ENROLL_ROLL_MAX", 12.0)
-    # Ne pas auto-enrôler un visage trop petit (qualité insuffisante).
-    AUTO_ENROLL_MIN_WIDTH_RATIO: float = _get_float("AUTO_ENROLL_MIN_WIDTH_RATIO", 0.08)
+    # Ne pas auto-enrôler un visage trop petit (qualité insuffisante). Abaissé à 0.02 pour capturer de plus loin.
+    AUTO_ENROLL_MIN_WIDTH_RATIO: float = _get_float("AUTO_ENROLL_MIN_WIDTH_RATIO", 0.02)
 
     # --- Action déclenchée à la reconnaissance ---
     # Valeurs: none | log | command | webhook

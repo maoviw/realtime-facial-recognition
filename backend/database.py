@@ -191,7 +191,7 @@ def log_event(
 def list_events(limit: int = 50) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM recognition_events ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM recognition_events ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     events = []

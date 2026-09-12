@@ -14,6 +14,7 @@ import io
 import logging
 import os
 from contextlib import asynccontextmanager
+from threading import Lock
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +28,7 @@ from config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("recognition.api")
+_analysis_lock = Lock()
 
 
 # Signatures binaires des formats image acceptés (magic bytes).
@@ -94,8 +96,7 @@ def _maybe_auto_enroll(
     """
     if not settings.AUTO_ENROLL:
         return None
-    if not recognition.is_clear_for_enrollment(pitch, yaw, roll):
-        return None
+    # On désactive la vérification d'angle pour l'enrôlement (demande utilisateur)
     # Ignore les visages trop petits (qualité de référence insuffisante).
     face_w = rect.get("width", 0)
     if frame_width > 0 and face_w / frame_width < settings.AUTO_ENROLL_MIN_WIDTH_RATIO:
@@ -147,16 +148,30 @@ def _decode_image(data_url: str) -> bytes:
 
 
 @app.post("/analyze-face", dependencies=[Depends(require_api_key)])
-async def analyze_face(payload: ImagePayload) -> dict:
-    if not settings.azure_configured():
-        raise HTTPException(status_code=500, detail="Azure Face API non configuré.")
+def analyze_face(payload: ImagePayload) -> dict:
+    if not _analysis_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Une analyse est déjà en cours. Réessayez après sa fin.",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        return _analyze_face(payload)
+    finally:
+        _analysis_lock.release()
 
+
+def _analyze_face(payload: ImagePayload) -> dict:
     image_bytes = _decode_image(payload.image)
 
     try:
         detected = recognition.detect_faces(image_bytes)
+    except recognition.EngineUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except recognition.DetectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except requests_exc() as exc:
-        raise HTTPException(status_code=502, detail=f"Erreur réseau vers Azure : {exc}")
+        raise HTTPException(status_code=502, detail="Erreur réseau vers Azure.") from exc
 
     if not detected:
         return {"faces": []}
@@ -173,10 +188,15 @@ async def analyze_face(payload: ImagePayload) -> dict:
     faces_out = []
     for face in detected:
             rect = face.get("faceRectangle", {})
-            pose = face.get("faceAttributes", {}).get("headPose", {})
+            attrs = face.get("faceAttributes", {})
+            pose = attrs.get("headPose", {})
             pitch = pose.get("pitch", 0.0)
             yaw = pose.get("yaw", 0.0)
             roll = pose.get("roll", 0.0)
+            
+            glasses = attrs.get("glasses", "NoGlasses")
+            mask = attrs.get("mask")
+            quality = attrs.get("quality")
 
             recognized = False
             confidence = 0.0
@@ -184,36 +204,38 @@ async def analyze_face(payload: ImagePayload) -> dict:
             ref_id = None
             system_action = "None"
 
-            if not recognition.is_looking_direct(pitch, yaw):
-                system_action = "User looking away"
-            else:
-                # Recadrage par visage : la vérification (et l'enrôlement) porte
-                # sur ce visage précis, pas sur l'ensemble de la frame.
-                face_path = recognition.save_temp_capture(image_bytes, rect)
-                try:
-                    recognized, confidence, matched = recognition.verify_against_references(face_path)
-                finally:
-                    if os.path.exists(face_path):
-                        os.remove(face_path)
+            # On ignore l'angle de tête pour la reconnaissance
+            # Recadrage par visage : la vérification (et l'enrôlement) porte
+            # sur ce visage précis, pas sur l'ensemble de la frame.
+            face_path = recognition.save_temp_capture(image_bytes, rect)
+            demographics = None
+            try:
+                recognized, confidence, matched = recognition.verify_against_references(face_path)
+                demographics = recognition.analyze_demographics(face_path)
+            except recognition.EngineUnavailableError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            finally:
+                if os.path.exists(face_path):
+                    os.remove(face_path)
 
-                if recognized and matched:
-                    name = matched["name"]
-                    ref_id = matched["id"]
-                    system_action = trigger_action(name, confidence)
-                elif recognition.DeepFace is None:
+            if recognized and matched:
+                name = matched["name"]
+                ref_id = matched["id"]
+                system_action = trigger_action(name, confidence)
+            elif recognition.DeepFace is None:
+                system_action = "No reference / DeepFace missing"
+            else:
+                enrolled = _maybe_auto_enroll(image_bytes, rect, pitch, yaw, roll, frame_width)
+                if enrolled:
+                    recognized = False
+                    confidence = 0.0
+                    name = enrolled["name"]
+                    ref_id = enrolled["id"]
+                    system_action = "Auto-enrôlé"
+                elif not database.list_references():
                     system_action = "No reference / DeepFace missing"
                 else:
-                    enrolled = _maybe_auto_enroll(image_bytes, rect, pitch, yaw, roll, frame_width)
-                    if enrolled:
-                        recognized = True
-                        confidence = 0.99
-                        name = enrolled["name"]
-                        ref_id = enrolled["id"]
-                        system_action = "Auto-enrôlé"
-                    elif not database.list_references():
-                        system_action = "No reference / DeepFace missing"
-                    else:
-                        system_action = "Not recognized"
+                    system_action = "Not recognized"
 
             database.log_event(
                 recognized=recognized,
@@ -241,6 +263,10 @@ async def analyze_face(payload: ImagePayload) -> dict:
                     "yaw": yaw,
                     "roll": roll,
                     "system_action": system_action,
+                    "glasses": glasses,
+                    "mask": mask,
+                    "quality": quality,
+                    "demographics": demographics
                 }
             )
 
@@ -312,3 +338,64 @@ def requests_exc():
     import requests
 
     return requests.exceptions.RequestException
+
+
+class CameraProxyPayload(BaseModel):
+    url: str
+    username: str = ""
+    password: str = ""
+
+
+@app.post("/proxy-camera", dependencies=[Depends(require_api_key)])
+async def proxy_camera(payload: CameraProxyPayload) -> dict:
+    """Proxy pour récupérer une image depuis une caméra IP en contournant les erreurs CORS."""
+    import requests
+    from requests.auth import HTTPBasicAuth
+    
+    try:
+        auth = HTTPBasicAuth(payload.username, payload.password) if payload.username else None
+        # Timeout court (5s) pour ne pas bloquer l'API si la caméra est éteinte, on utilise stream=True pour gérer les flux vidéo
+        resp = requests.get(payload.url, auth=auth, timeout=5, stream=True)
+        resp.raise_for_status()
+        
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type.lower():
+            raise HTTPException(
+                status_code=400, 
+                detail="L'URL fournie renvoie une page web (interface de la caméra) au lieu d'une image. Pour les caméras D-Link, assurez-vous de pointer vers le flux image, par exemple : http://votre-ip/image/jpeg.cgi"
+            )
+            
+        # Si c'est un flux vidéo MJPEG (ex: video.cgi), on extrait juste la première image (JPEG)
+        if "multipart" in content_type.lower() or "mixed-replace" in content_type.lower():
+            image_bytes = b""
+            for chunk in resp.iter_content(chunk_size=4096):
+                if chunk:
+                    image_bytes += chunk
+                    start = image_bytes.find(b"\xff\xd8")
+                    end = image_bytes.find(b"\xff\xd9")
+                    if start != -1 and end != -1 and end > start:
+                        image_bytes = image_bytes[start:end+2]
+                        break
+                    # Sécurité pour ne pas télécharger indéfiniment si pas de JPEG trouvé
+                    if len(image_bytes) > 2 * 1024 * 1024:
+                        raise HTTPException(status_code=502, detail="Impossible d'extraire une image du flux vidéo.")
+            mime_type = "image/jpeg"
+        else:
+            # C'est une simple image (ex: image/jpeg.cgi)
+            image_bytes = resp.content
+            mime_type = content_type if "image/" in content_type.lower() else "image/jpeg"
+
+        if not image_bytes:
+            raise HTTPException(status_code=502, detail="Flux vidéo ou image vide.")
+
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return {"image": f"data:{mime_type};base64,{b64}"}
+        
+    except requests.exceptions.RequestException as e:
+        logger.error("Erreur proxy caméra IP: %s", e)
+        raise HTTPException(status_code=502, detail=f"Impossible de joindre la caméra: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Erreur inattendue proxy caméra: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
