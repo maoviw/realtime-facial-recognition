@@ -351,6 +351,40 @@ def test_bad_base64(client, monkeypatch):
     assert resp.status_code == 400
 
 
+def test_search_history_matches_name_and_track(client):
+    database.log_event(
+        recognized=True,
+        confidence=0.9,
+        name="Alice",
+        event_type="face",
+        track_id="face-7",
+        summary="Personne reconnue",
+    )
+    response = client.get("/history/search?q=Alice")
+    assert response.status_code == 200
+    event = response.json()["events"][0]
+    assert event["name"] == "Alice"
+    assert event["track_id"] == "face-7"
+    assert event["objects"] == []
+
+
+def test_zone_and_alert_rule_lifecycle(client):
+    zone = client.post(
+        "/zones",
+        json={"name": "Entrée", "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]]},
+    )
+    assert zone.status_code == 200
+    zone_id = zone.json()["id"]
+    rule = client.post(
+        "/alerts",
+        json={"name": "Visage dans l'entrée", "zone_id": zone_id, "cooldown_seconds": 30},
+    )
+    assert rule.status_code == 200
+    assert rule.json()["zone_id"] == zone_id
+    assert client.delete(f"/alerts/{rule.json()['id']}").status_code == 200
+    assert client.delete(f"/zones/{zone_id}").status_code == 200
+
+
 @pytest.mark.parametrize("multipart", [False, True])
 def test_proxy_camera_returns_jpeg_without_analysis(client, monkeypatch, multipart):
     image_bytes = base64.b64decode(PIXEL_B64.split(",", 1)[1])

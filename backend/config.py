@@ -72,6 +72,7 @@ class Settings:
     RECOGNITION_ACTION: str = os.getenv("RECOGNITION_ACTION", "log").lower()
     RECOGNITION_COMMAND: str = os.getenv("RECOGNITION_COMMAND", "")
     RECOGNITION_WEBHOOK_URL: str = os.getenv("RECOGNITION_WEBHOOK_URL", "")
+    RECOGNITION_WEBHOOK_COOLDOWN: float = _get_float("RECOGNITION_WEBHOOK_COOLDOWN", 60.0)
     # L'exécution de commandes arbitraires (RECOGNITION_ACTION=command) est une
     # surface d'abus : elle doit être explicitement activée par l'opérateur.
     ALLOW_COMMAND_ACTION: bool = _get_bool("ALLOW_COMMAND_ACTION", False)

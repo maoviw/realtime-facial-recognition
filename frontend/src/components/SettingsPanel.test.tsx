@@ -19,6 +19,12 @@ describe("SettingsPanel debounce", () => {
         onToggleRunning={() => {}}
         ipCamera={{ enabled: false, url: "http://192.168.1.43/image/jpeg.cgi" }}
         onIpCameraChange={() => {}}
+        zones={[]}
+        alertRules={[]}
+        onCreateZone={async () => {}}
+        onDeleteZone={async () => {}}
+        onCreateAlertRule={async () => {}}
+        onDeleteAlertRule={async () => {}}
       />,
     );
 

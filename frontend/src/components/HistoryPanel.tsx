@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo } from "react";
-import { History } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { History, Search } from "lucide-react";
 import type { RecognitionEvent } from "@/lib/types";
 
 function timeAgo(iso: string): string {
@@ -15,9 +15,18 @@ function timeAgo(iso: string): string {
 
 export default function HistoryPanel({
   events,
+  onSearch,
 }: {
   events: RecognitionEvent[];
+  onSearch?: (query: string) => void;
 }) {
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    if (!onSearch) return;
+    const timer = setTimeout(() => onSearch(query.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [onSearch, query]);
+
   // Pré-calcule le libellé temporel par événement ; ne se recalcule que si la
   // liste change (et non à chaque re-render du tableau de bord parent).
   const rows = useMemo(
@@ -25,18 +34,28 @@ export default function HistoryPanel({
     [events],
   );
 
-  if (events.length === 0) {
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-4 text-sm text-slate-500">
-        <History className="h-8 w-8 opacity-50" aria-hidden="true" />
-        <p>Aucun événement pour le moment.</p>
-      </div>
-    );
-  }
-
   return (
-    <ul className="flex flex-col gap-2 overflow-y-auto pr-2 custom-scrollbar">
-      {rows.map(({ event: e, ago }) => (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {onSearch && (
+        <label className="relative block">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" aria-hidden="true" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Rechercher un nom ou un événement"
+            aria-label="Rechercher dans l'historique"
+            className="w-full rounded-md border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-sm text-slate-200 outline-none focus:border-amber-500"
+          />
+        </label>
+      )}
+      {events.length === 0 ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-4 text-sm text-slate-500">
+          <History className="h-8 w-8 opacity-50" aria-hidden="true" />
+          <p>{query ? "Aucun résultat." : "Aucun événement pour le moment."}</p>
+        </div>
+      ) : (
+        <ul className="flex flex-col gap-2 overflow-y-auto pr-2 custom-scrollbar">
+          {rows.map(({ event: e, ago }) => (
         <li
           key={e.id}
           className="flex items-center justify-between rounded-lg border border-slate-700/50 bg-slate-800/40 px-3 py-2 text-xs"
@@ -59,7 +78,9 @@ export default function HistoryPanel({
             {ago}
           </time>
         </li>
-      ))}
-    </ul>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }

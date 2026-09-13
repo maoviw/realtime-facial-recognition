@@ -32,6 +32,16 @@ Webcam ──► Frontend (capture périodique, anti-empilement)
 - **Action configurable et cross-platform** : `log`, `command` ou `webhook`
   (remplace l'ancien `notepad.exe` Windows-only).
 - **Historique persistant** : chaque événement est journalisé en base SQLite.
+- **Suivi local** : chaque visage reçoit un `track_id` stable entre captures
+  proches, avec expiration automatique des pistes inactives.
+- **Alertes de zone** : une règle active de type `face` se déclenche quand le
+  centre d'un visage entre dans sa zone ; les types `recognized` et `unknown`
+  permettent de cibler respectivement les visages reconnus ou inconnus. Le
+  cooldown est appliqué par règle.
+- **Dessin des zones** : depuis Réglages, cliquez directement dans l'aperçu
+  pour placer les sommets du polygone ; au moins trois clics sont nécessaires.
+- **Recherche d'événements** : recherche par nom, action, résumé, objet,
+  type, état reconnu/inconnu et fenêtre temporelle via SQLite.
 - **Enrôlement par upload** : ajout/suppression de visages depuis l'interface.
 - **Réglages live** : intervalle de capture, pause/reprise.
 - **Sécurité** : CORS restreint, clé API optionnelle, fichiers temporaires uniques.
@@ -243,8 +253,22 @@ images analysées restent les images synthétiques du banc, distinctes de la vid
 | `GET` | `/references` | Liste les références |
 | `DELETE` | `/references/{id}` | Supprime une référence |
 | `GET` | `/history?limit=N` | Historique des reconnaissances |
+| `GET` | `/history/search?q=...` | Recherche structurée dans les événements |
+| `GET/POST/DELETE` | `/zones` | Zones polygonales normalisées |
+| `GET/POST/DELETE` | `/alerts` | Règles d’alerte et cooldown |
 
 Si `API_KEY` est défini, passez l'en-tête `x-api-key` sur les routes protégées.
+
+### Fonctions ClearCam et périmètre local
+
+Le suivi, la recherche et les alertes faciales sont maintenant intégrés sans
+service externe. L'action `webhook` existante peut servir de notification vers
+un relais mobile privé ; elle reste désactivée par défaut et les alertes sans
+URL configurée sont seulement journalisées. La détection générique d'objets (YOLO) et les
+résumés VLM/IA de ClearCam ne sont pas simulés : ils seront ajoutés derrière des
+adaptateurs optionnels après validation du modèle, de la licence et du budget
+CPU/GPU. Azure Face + DeepFace restent la source d'identité, et un résumé IA ne
+pourra jamais créer une identité ni déclencher seul une action sensible.
 
 ---
 

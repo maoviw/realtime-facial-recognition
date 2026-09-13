@@ -6,7 +6,7 @@ import Link from "next/link";
 import { Activity, Cpu, History, Pause, Play, ScanFace, Settings, Users, Video, Zap } from "lucide-react";
 
 import { api } from "@/lib/api";
-import type { FaceData, IpCameraConfig, RecognitionEvent, ReferenceFace } from "@/lib/types";
+import type { AlertRule, FaceData, IpCameraConfig, RecognitionEvent, ReferenceFace, Zone } from "@/lib/types";
 import { ToastProvider, useToast } from "@/components/Toast";
 import CameraView from "@/components/CameraView";
 import TelemetryPanel from "@/components/TelemetryPanel";
@@ -66,6 +66,8 @@ function Dashboard() {
   const [tab, setTab] = useState<Tab>("telemetry");
   const [references, setReferences] = useState<ReferenceFace[]>([]);
   const [events, setEvents] = useState<RecognitionEvent[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
+  const [alertRules, setAlertRules] = useState<AlertRule[]>([]);
 
   const [running, setRunning] = useState(false);
   const [intervalMs, setIntervalMs] = useState(3000);
@@ -125,6 +127,36 @@ function Dashboard() {
     }
   }, [notify]);
 
+  const loadZonesAndRules = useCallback(async () => {
+    try {
+      const [{ zones: loadedZones }, { rules }] = await Promise.all([api.zones(), api.alertRules()]);
+      setZones(loadedZones);
+      setAlertRules(rules);
+    } catch (err) {
+      notify(`Chargement des zones : ${(err as Error).message}`, "error");
+    }
+  }, [notify]);
+
+  const createZone = useCallback(async (name: string, polygon: number[][]) => {
+    try { await api.createZone({ name, polygon, enabled: true }); await loadZonesAndRules(); notify("Zone ajoutée.", "success"); }
+    catch (err) { notify(`Zone invalide : ${(err as Error).message}`, "error"); }
+  }, [loadZonesAndRules, notify]);
+
+  const deleteZone = useCallback(async (id: number) => {
+    try { await api.deleteZone(id); await loadZonesAndRules(); notify("Zone supprimée.", "success"); }
+    catch (err) { notify(`Suppression de zone : ${(err as Error).message}`, "error"); }
+  }, [loadZonesAndRules, notify]);
+
+  const createAlertRule = useCallback(async (name: string, zoneId: number | null, eventType: string, cooldown: number) => {
+    try { await api.createAlertRule({ name, zone_id: zoneId, event_type: eventType, notify: true, enabled: true, cooldown_seconds: cooldown }); await loadZonesAndRules(); notify("Règle ajoutée.", "success"); }
+    catch (err) { notify(`Règle invalide : ${(err as Error).message}`, "error"); }
+  }, [loadZonesAndRules, notify]);
+
+  const deleteAlertRule = useCallback(async (id: number) => {
+    try { await api.deleteAlertRule(id); await loadZonesAndRules(); notify("Règle supprimée.", "success"); }
+    catch (err) { notify(`Suppression de règle : ${(err as Error).message}`, "error"); }
+  }, [loadZonesAndRules, notify]);
+
   const addReference = useCallback(
     async (name: string, file: File) => {
       try {
@@ -173,6 +205,19 @@ function Dashboard() {
       /* silencieux : non bloquant */
     }
   }, []);
+
+  const searchHistory = useCallback(async (query: string) => {
+    if (!query) {
+      await loadHistory();
+      return;
+    }
+    try {
+      const { events: matches } = await api.searchHistory(query, 30);
+      setEvents(matches);
+    } catch {
+      /* silencieux : la recherche ne doit pas interrompre la capture */
+    }
+  }, [loadHistory]);
 
   // --- Boucle de capture (anti-empilement) ---
   const captureAndAnalyze = useCallback(async () => {
@@ -238,8 +283,8 @@ function Dashboard() {
   // les setState surviennent après await — pas de rendu en cascade synchrone).
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void Promise.all([checkHealth(), loadReferences(), loadHistory()]);
-  }, [checkHealth, loadReferences, loadHistory]);
+    void Promise.all([checkHealth(), loadReferences(), loadHistory(), loadZonesAndRules()]);
+  }, [checkHealth, loadReferences, loadHistory, loadZonesAndRules]);
 
   // Boucle d'analyse
   useEffect(() => {
@@ -410,7 +455,7 @@ function Dashboard() {
 
             <div className="flex min-h-[24rem] flex-1 flex-col">
               {tab === "telemetry" && <TelemetryPanel faces={faces} />}
-              {tab === "history" && <HistoryPanel events={events} />}
+              {tab === "history" && <HistoryPanel events={events} onSearch={searchHistory} />}
               {tab === "references" && (
                 <ReferencesPanel
                   references={references}
@@ -427,6 +472,12 @@ function Dashboard() {
                   onToggleRunning={() => setRunning((r) => !r)}
                   ipCamera={ipCamera}
                   onIpCameraChange={handleIpCameraChange}
+                  zones={zones}
+                  alertRules={alertRules}
+                  onCreateZone={createZone}
+                  onDeleteZone={deleteZone}
+                  onCreateAlertRule={createAlertRule}
+                  onDeleteAlertRule={deleteAlertRule}
                 />
               )}
             </div>

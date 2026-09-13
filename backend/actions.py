@@ -11,12 +11,42 @@ Dans tous les cas, l'événement est journalisé.
 import logging
 import shlex
 import subprocess
+import threading
+import time
 
 import requests
 
 from config import mask_name, settings
 
 logger = logging.getLogger("recognition.actions")
+_notification_lock = threading.Lock()
+_last_notifications: dict[str, float] = {}
+
+
+def trigger_alert(rule: dict, payload: dict) -> str:
+    """Déclenche une notification de règle au plus une fois par cooldown."""
+    if not rule.get("enabled", True) or not rule.get("notify", True):
+        return "Alerte désactivée"
+    url = settings.RECOGNITION_WEBHOOK_URL.strip()
+    if not url:
+        logger.info("Alerte %s détectée, webhook non configuré.", rule.get("name", rule.get("id")))
+        return "Alerte détectée (webhook non configuré)"
+
+    key = f"alert:{rule['id']}"
+    now = time.monotonic()
+    with _notification_lock:
+        last = _last_notifications.get(key, 0.0)
+        if now - last < float(rule.get("cooldown_seconds", 60)):
+            return "Alerte ignorée (cooldown)"
+        _last_notifications[key] = now
+    try:
+        requests.post(url, json={"rule": rule.get("name"), **payload}, timeout=settings.AZURE_TIMEOUT)
+        return "Alerte webhook envoyée"
+    except requests.RequestException as exc:
+        with _notification_lock:
+            _last_notifications.pop(key, None)
+        logger.error("Échec de l'alerte webhook: %s", exc)
+        return "Échec alerte webhook"
 
 
 def trigger_action(name: str | None, confidence: float) -> str:
@@ -59,6 +89,12 @@ def trigger_action(name: str | None, confidence: float) -> str:
         if not url:
             logger.warning("RECOGNITION_ACTION=webhook mais RECOGNITION_WEBHOOK_URL est vide.")
             return "Webhook non configuré"
+        now = time.monotonic()
+        with _notification_lock:
+            last = _last_notifications.get(label, 0.0)
+            if now - last < settings.RECOGNITION_WEBHOOK_COOLDOWN:
+                return "Webhook ignoré (cooldown)"
+            _last_notifications[label] = now
         try:
             requests.post(
                 url,
@@ -67,6 +103,8 @@ def trigger_action(name: str | None, confidence: float) -> str:
             )
             return "Webhook appelé"
         except requests.RequestException as exc:
+            with _notification_lock:
+                _last_notifications.pop(label, None)
             logger.error("Échec de l'appel webhook: %s", exc)
             return "Échec webhook"
 

@@ -55,6 +55,10 @@ export interface RecognitionEvent {
   yaw: number | null;
   roll: number | null;
   system_action: string | null;
+  event_type?: string;
+  track_id?: string | null;
+  objects?: Array<{ label: string; confidence?: number }>;
+  summary?: string | null;
   created_at: string;
 }
 
@@ -71,4 +75,21 @@ export interface HealthStatus {
   deepface_available: boolean;
   references: number;
   recognition_action: string;
+}
+
+export interface Zone {
+  id: number;
+  name: string;
+  polygon: number[][];
+  enabled: boolean;
+}
+
+export interface AlertRule {
+  id: number;
+  name: string;
+  zone_id: number | null;
+  event_type: string;
+  notify: boolean;
+  enabled: boolean;
+  cooldown_seconds: number;
 }

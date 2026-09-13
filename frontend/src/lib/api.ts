@@ -115,6 +115,29 @@ export const api = {
       headers: authHeaders(),
     }),
 
+  searchHistory: (query: string, limit = 50) =>
+    request<{ events: RecognitionEvent[] }>(
+      `/history/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+      { headers: authHeaders() },
+    ),
+
+  zones: () => request<{ zones: import("@/lib/types").Zone[] }>("/zones", { headers: authHeaders() }),
+  createZone: (zone: Omit<import("@/lib/types").Zone, "id">) =>
+    request<import("@/lib/types").Zone>("/zones", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(zone),
+    }),
+  deleteZone: (id: number) => request<{ deleted: number }>(`/zones/${id}`, { method: "DELETE", headers: authHeaders() }),
+  alertRules: () => request<{ rules: import("@/lib/types").AlertRule[] }>("/alerts", { headers: authHeaders() }),
+  createAlertRule: (rule: Omit<import("@/lib/types").AlertRule, "id">) =>
+    request<import("@/lib/types").AlertRule>("/alerts", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(rule),
+    }),
+  deleteAlertRule: (id: number) => request<{ deleted: number }>(`/alerts/${id}`, { method: "DELETE", headers: authHeaders() }),
+
   proxyCamera: (url: string, username?: string, password?: string) =>
     request<{ image: string }>("/proxy-camera", {
       method: "POST",

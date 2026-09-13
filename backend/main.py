@@ -31,7 +31,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import database
 import metrics
 import recognition
-from actions import trigger_action
+from tracking import FaceTracker
+import zones as zone_logic
+from actions import trigger_action, trigger_alert
 from config import mask_name, settings
 
 
@@ -67,6 +69,7 @@ def _configure_logging() -> None:
 _configure_logging()
 logger = logging.getLogger("recognition.api")
 _analysis_lock = Lock()
+_face_tracker = FaceTracker()
 
 
 # Signatures binaires des formats image acceptés (magic bytes).
@@ -204,6 +207,21 @@ class RenamePayload(BaseModel):
     name: str = Field(min_length=1, max_length=100)
 
 
+class ZonePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    polygon: list[list[float]]
+    enabled: bool = True
+
+
+class AlertRulePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    zone_id: int | None = None
+    event_type: str = Field(default="face", min_length=1, max_length=40)
+    notify: bool = True
+    enabled: bool = True
+    cooldown_seconds: float = Field(default=60, ge=0, le=86400)
+
+
 def _maybe_auto_enroll(
     image_bytes: bytes, rect: dict, pitch: float, yaw: float, roll: float, frame_width: int
 ) -> dict | None:
@@ -252,6 +270,49 @@ async def get_settings() -> dict:
         "recognition_action": settings.RECOGNITION_ACTION,
         "deepface_model": settings.DEEPFACE_MODEL,
     }
+
+
+@app.get("/zones", dependencies=[Depends(require_api_key)])
+async def get_zones() -> dict:
+    return {"zones": database.list_zones()}
+
+
+@app.post("/zones", dependencies=[Depends(require_api_key)])
+async def add_zone(payload: ZonePayload) -> dict:
+    try:
+        polygon = zone_logic.validate_polygon(payload.polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return database.create_zone(payload.name.strip(), polygon, payload.enabled)
+
+
+@app.delete("/zones/{zone_id}", dependencies=[Depends(require_api_key)])
+async def remove_zone(zone_id: int) -> dict:
+    if not database.delete_zone(zone_id):
+        raise HTTPException(status_code=404, detail="Zone introuvable.")
+    return {"deleted": zone_id}
+
+
+@app.get("/alerts", dependencies=[Depends(require_api_key)])
+async def get_alert_rules() -> dict:
+    return {"rules": database.list_alert_rules()}
+
+
+@app.post("/alerts", dependencies=[Depends(require_api_key)])
+async def add_alert_rule(payload: AlertRulePayload) -> dict:
+    if payload.zone_id is not None and payload.zone_id not in {zone["id"] for zone in database.list_zones()}:
+        raise HTTPException(status_code=404, detail="Zone introuvable.")
+    return database.create_alert_rule(
+        payload.name.strip(), payload.zone_id, payload.event_type,
+        payload.notify, payload.enabled, payload.cooldown_seconds,
+    )
+
+
+@app.delete("/alerts/{rule_id}", dependencies=[Depends(require_api_key)])
+async def remove_alert_rule(rule_id: int) -> dict:
+    if not database.delete_alert_rule(rule_id):
+        raise HTTPException(status_code=404, detail="Règle introuvable.")
+    return {"deleted": rule_id}
 
 
 def _decode_image(data_url: str) -> bytes:
@@ -316,9 +377,20 @@ def _analyze_face(payload: ImagePayload) -> dict:
         except Exception:  # noqa: BLE001
             frame_width = 0
 
+    frame_height = 0
+    if recognition.Image is not None:
+        try:
+            with recognition.Image.open(io.BytesIO(image_bytes)) as _img:
+                frame_height = _img.size[1]
+        except Exception:  # noqa: BLE001
+            frame_height = 0
+    configured_zones = database.list_zones()
     faces_out = []
-    for face in detected:
+    track_ids = _face_tracker.update([face.get("faceRectangle", {}) for face in detected])
+    for face, track_id in zip(detected, track_ids):
             rect = face.get("faceRectangle", {})
+            zone_rect = {**rect, "frame_width": frame_width, "frame_height": frame_height}
+            zone_ids = zone_logic.rectangle_zones(zone_rect, configured_zones)
             attrs = face.get("faceAttributes", {})
             pose = attrs.get("headPose", {})
             pitch = pose.get("pitch", 0.0)
@@ -371,6 +443,22 @@ def _analyze_face(payload: ImagePayload) -> dict:
                 else:
                     system_action = "Not recognized"
 
+            alert_actions = []
+            for rule in database.list_alert_rules():
+                event_kind = "recognized" if recognized else "unknown"
+                matches_type = rule["event_type"] in {"face", event_kind}
+                matches_zone = rule["zone_id"] is None or rule["zone_id"] in zone_ids
+                if matches_type and matches_zone:
+                    alert_actions.append(trigger_alert(rule, {
+                        "event_type": "face",
+                        "track_id": track_id,
+                        "name": name,
+                        "recognized": recognized,
+                        "zone_ids": zone_ids,
+                    }))
+            if alert_actions:
+                system_action = f"{system_action}; {'; '.join(alert_actions)}"
+
             database.log_event(
                 recognized=recognized,
                 confidence=confidence,
@@ -380,6 +468,8 @@ def _analyze_face(payload: ImagePayload) -> dict:
                 name=name,
                 reference_id=ref_id,
                 system_action=system_action,
+                track_id=track_id,
+                objects=[{"type": "face", "track_id": track_id, "zone_ids": zone_ids}],
             )
 
             faces_out.append(
@@ -397,6 +487,8 @@ def _analyze_face(payload: ImagePayload) -> dict:
                     "yaw": yaw,
                     "roll": roll,
                     "system_action": system_action,
+                    "track_id": track_id,
+                    "zone_ids": zone_ids,
                     "glasses": glasses,
                     "mask": mask,
                     "quality": quality,
@@ -472,6 +564,27 @@ async def get_history(limit: int = 50) -> dict:
     # Borne le paramètre pour éviter les extractions massives.
     limit = max(1, min(limit, settings.HISTORY_LIMIT_MAX))
     return {"events": database.list_events(limit=limit)}
+
+
+@app.get("/history/search", dependencies=[Depends(require_api_key)])
+async def search_history(
+    q: str | None = None,
+    event_type: str | None = None,
+    recognized: bool | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 100,
+) -> dict:
+    return {
+        "events": database.search_events(
+            query=q,
+            event_type=event_type,
+            recognized=recognized,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+    }
 
 
 def requests_exc():
