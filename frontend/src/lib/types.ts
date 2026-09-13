@@ -14,6 +14,29 @@ export interface FaceData {
   yaw: number;
   roll: number;
   system_action: string;
+  glasses?: string;
+  mask?: {
+    type: string;
+    nose_and_mouth_covered: boolean;
+  } | null;
+  quality?: {
+    is_sufficient_quality: boolean;
+    issues: string[];
+    metrics: {
+      blur?: { level: string; value: number };
+      exposure?: { level: string; value: number };
+      occlusion?: {
+        forehead_occluded: boolean;
+        eye_occluded: boolean;
+        mouth_occluded: boolean;
+      };
+    };
+  };
+  demographics?: {
+    age: number;
+    gender: string;
+    emotion: string;
+  } | null;
 }
 
 export interface ReferenceFace {
@@ -33,6 +56,13 @@ export interface RecognitionEvent {
   roll: number | null;
   system_action: string | null;
   created_at: string;
+}
+
+export interface IpCameraConfig {
+  enabled: boolean;
+  url: string;
+  username?: string;
+  password?: string;
 }
 
 export interface HealthStatus {

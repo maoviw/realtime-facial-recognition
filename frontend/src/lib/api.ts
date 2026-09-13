@@ -102,4 +102,11 @@ export const api = {
     request<{ events: RecognitionEvent[] }>(`/history?limit=${limit}`, {
       headers: authHeaders(),
     }),
+
+  proxyCamera: (url: string, username?: string, password?: string) =>
+    request<{ image: string }>("/proxy-camera", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ url, username, password }),
+    }),
 };
