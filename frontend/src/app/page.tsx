@@ -254,18 +254,40 @@ function Dashboard() {
     return () => clearInterval(id);
   }, [loadHistory]);
 
+  // Health-check périodique + reconnexion auto (R15) : sonde le backend toutes
+  // les 10 s. Un garde-fou `inFlight` garantit une seule requête en vol (évite
+  // l'empilement si une sonde dépasse l'intervalle).
+  useEffect(() => {
+    let inFlight = false;
+    const id = setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
+      const wasOffline = backendOnline === false;
+      try {
+        const h = await api.health();
+        setBackendOnline(true);
+        if (wasOffline) {
+          notify("Backend de nouveau en ligne.", "success");
+          void loadReferences();
+          void loadHistory();
+          if (!h.azure_configured) {
+            notify("Azure Face API non configuré côté backend.", "error");
+          }
+        }
+      } catch {
+        setBackendOnline(false);
+      } finally {
+        inFlight = false;
+      }
+    }, 10000);
+    return () => clearInterval(id);
+  }, [backendOnline, notify, loadReferences, loadHistory]);
+
   const handleVideoLoad = (e: React.SyntheticEvent<HTMLVideoElement | HTMLImageElement>) => {
     const el = e.currentTarget;
-    let width = 0;
-    let height = 0;
-    if ("videoWidth" in el) {
-      width = (el as HTMLVideoElement).videoWidth;
-      height = (el as HTMLVideoElement).videoHeight;
-    } else {
-      width = (el as HTMLImageElement).naturalWidth;
-      height = (el as HTMLImageElement).naturalHeight;
-    }
-    const size = { width, height };
+    const size = "videoWidth" in el
+      ? { width: el.videoWidth, height: el.videoHeight }
+      : { width: el.naturalWidth, height: el.naturalHeight };
     cameraSizeRef.current = size;
     setCameraSize(size);
   };

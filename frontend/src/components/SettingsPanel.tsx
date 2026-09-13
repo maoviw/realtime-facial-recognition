@@ -2,6 +2,7 @@
 
 import { Pause, Play, ShieldAlert } from "lucide-react";
 import type { IpCameraConfig } from "@/lib/types";
+import { useEffect, useRef, useState } from "react";
 
 interface Props {
   intervalMs: number;
@@ -20,6 +21,33 @@ export default function SettingsPanel({
   ipCamera,
   onIpCameraChange,
 }: Props) {
+  // Valeur affichée immédiate ; la remontée au parent (qui recrée la boucle de
+  // capture) est débouncée pour éviter de relancer un timer à chaque tick du
+  // curseur pendant le glissement.
+  const [localMs, setLocalMs] = useState(intervalMs);
+  const [prevProp, setPrevProp] = useState(intervalMs);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Resynchronise si la valeur parente change depuis l'extérieur (ajustement
+  // d'état pendant le rendu — pattern React, sans effet).
+  if (intervalMs !== prevProp) {
+    setPrevProp(intervalMs);
+    setLocalMs(intervalMs);
+  }
+
+  // Nettoie le timer en attente au démontage.
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, []);
+
+  const handleSlide = (ms: number) => {
+    setLocalMs(ms);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => onIntervalChange(ms), 250);
+  };
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-3">
@@ -50,7 +78,7 @@ export default function SettingsPanel({
         >
           <span>Intervalle de capture</span>
           <span className="font-mono text-slate-200">
-            {(intervalMs / 1000).toFixed(1)} s
+            {(localMs / 1000).toFixed(1)} s
           </span>
         </label>
         <input
@@ -59,8 +87,8 @@ export default function SettingsPanel({
           min={1000}
           max={10000}
           step={500}
-          value={intervalMs}
-          onChange={(e) => onIntervalChange(Number(e.target.value))}
+          value={localMs}
+          onChange={(e) => handleSlide(Number(e.target.value))}
           className="w-full accent-amber-500"
         />
         <p className="text-xs text-slate-500">

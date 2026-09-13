@@ -16,6 +16,7 @@ _TEST_ENV = {
     "RECOGNITION_ACTION": "log",
     "API_KEY": "",
     "ENV": "development",
+    "RATE_LIMIT": "",
 }
 
 from fastapi.testclient import TestClient  # noqa: E402

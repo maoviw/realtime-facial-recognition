@@ -76,5 +76,7 @@ jobs:
         run: npx eslint src
       - name: Video access tests
         run: npm run test:video
+      - name: Test
+        run: npm test
       - name: Build
         run: npm run build

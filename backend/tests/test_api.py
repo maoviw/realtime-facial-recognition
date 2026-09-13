@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 from threading import Event
 from unittest.mock import Mock
+import logging
 
 import httpx
 import pytest
@@ -243,6 +244,9 @@ def test_rename_reference(client):
     # Renommer une référence inexistante -> 404.
     assert client.patch("/references/999999", json={"name": "X"}).status_code == 404
 
+    # Un nom uniquement composé d'espaces est rejeté (422) après strip.
+    assert client.patch(f"/references/{ref_id}", json={"name": "   "}).status_code == 422
+
 
 def test_reference_image_endpoint(client):
     img = base64.b64decode(PIXEL_B64.split(",", 1)[1])
@@ -412,3 +416,228 @@ def test_proxy_camera_requires_configured_api_key(client, monkeypatch):
     response = client.post("/proxy-camera", json={"url": "http://camera.test/image/jpeg.cgi"})
     assert response.status_code == 401
     camera_get.assert_not_called()
+# --- Sprint 1 — Sécurité & conformité ---
+
+def test_security_headers_present(client):
+    resp = client.get("/health")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["x-frame-options"] == "DENY"
+    assert resp.headers["referrer-policy"] == "no-referrer"
+    assert "content-security-policy" in resp.headers
+
+
+def test_requires_api_key(client, monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "API_KEY", "secret")
+    # Sans en-tête -> 401.
+    assert client.get("/references").status_code == 401
+    # Avec la bonne clé -> 200.
+    assert client.get("/references", headers={"x-api-key": "secret"}).status_code == 200
+
+
+def test_pii_masking(client, monkeypatch, caplog):
+    from config import settings
+
+    monkeypatch.setattr(settings, "LOG_MASK_PII", True)
+    fake = [{"faceRectangle": {"top": 1, "left": 2, "width": 3, "height": 4},
+             "faceAttributes": {"headPose": {"pitch": 0, "yaw": 0, "roll": 0}}}]
+    monkeypatch.setattr(recognition, "detect_faces", lambda b: fake)
+    monkeypatch.setattr(
+        recognition, "verify_against_references",
+        lambda path: (True, 0.91, {"id": 1, "name": "Alice"}),
+    )
+    with caplog.at_level(logging.INFO):
+        client.post("/analyze-face", json={"image": PIXEL_B64})
+    # Le nom en clair ne doit jamais apparaître dans les logs ; sa forme
+    # masquée (première lettre + astérisques) oui.
+    assert "Alice" not in caplog.text
+    assert "A****" in caplog.text
+
+
+def test_rate_limit_enforced():
+    """Le câblage slowapi renvoie bien un 429 au-delà de la limite."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from slowapi import Limiter
+    from slowapi.middleware import SlowAPIMiddleware
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+
+    app = FastAPI()
+    app.state.limiter = Limiter(key_func=get_remote_address, default_limits=["3/minute"])
+    app.add_exception_handler(RateLimitExceeded, main._rate_limit_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
+    @app.get("/ping")
+    async def ping():
+        return {"ok": True}
+
+    with TestClient(app) as c:
+        statuses = [c.get("/ping").status_code for _ in range(6)]
+    assert 429 in statuses
+
+
+# --- Sprint 2 — Fiabilité & résilience ---
+
+def test_azure_retries_then_succeeds(monkeypatch):
+    """detect_faces réessaie sur erreur réseau transitoire puis réussit."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "AZURE_MAX_RETRIES", 2)
+    monkeypatch.setattr(settings, "AZURE_BACKOFF_BASE", 0)  # pas d'attente en test
+    monkeypatch.setattr(recognition.time, "sleep", lambda s: None)
+
+    calls = {"n": 0}
+
+    service = Mock()
+    def fake_detect(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("boom")
+        return []
+
+    service.analyze_face_quality.side_effect = fake_detect
+    monkeypatch.setattr(recognition, "azure_service", service)
+    result = _detect_faces(b"img")
+    assert calls["n"] == 3
+    assert result == []
+
+
+def test_azure_retries_exhausted(monkeypatch):
+    """Après épuisement des tentatives, l'erreur réseau est propagée."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "AZURE_MAX_RETRIES", 1)
+    monkeypatch.setattr(settings, "AZURE_BACKOFF_BASE", 0)
+    monkeypatch.setattr(recognition.time, "sleep", lambda s: None)
+
+    service = Mock()
+    def always_fail(*a, **k):
+        raise RuntimeError("slow")
+
+    service.analyze_face_quality.side_effect = always_fail
+    monkeypatch.setattr(recognition, "azure_service", service)
+    with pytest.raises(recognition.DetectionError):
+        _detect_faces(b"img")
+
+
+def test_deepface_timeout_skips_reference(monkeypatch, tmp_path):
+    """Une vérification DeepFace qui dépasse le délai n'interrompt pas la boucle."""
+    import time as _time
+
+    from config import settings
+
+    import types
+
+    ref_img = tmp_path / "ref.jpg"
+    ref_img.write_bytes(b"x")
+    monkeypatch.setattr(settings, "DEEPFACE_TIMEOUT", 0.2)
+
+    def slow_verify(*a, **k):
+        _time.sleep(2)
+        return {"verified": True, "distance": 0.1}
+
+    monkeypatch.setattr(recognition, "DeepFace", types.SimpleNamespace(verify=slow_verify))
+    monkeypatch.setattr(
+        recognition, "list_references_internal",
+        lambda: [{"id": 1, "name": "Slow", "image_path": str(ref_img)}],
+    )
+    recognized, confidence, matched = recognition.verify_against_references("cap.jpg")
+    assert recognized is False
+    assert matched is None
+
+
+def test_purge_old_events(client):
+    import database
+
+    # Événement ancien (au-delà du TTL) + événement récent.
+    with database.get_connection() as conn:
+        conn.execute(
+            """INSERT INTO recognition_events
+               (recognized, confidence, system_action, created_at)
+               VALUES (0, 0.0, 'old', '2000-01-01T00:00:00+00:00')"""
+        )
+    database.log_event(recognized=False, confidence=0.0, system_action="new")
+
+    removed = database.purge_old_events(ttl_days=30, max_rows=0)
+    assert removed >= 1
+    remaining = [e["system_action"] for e in database.list_events(limit=100)]
+    assert "old" not in remaining
+    assert "new" in remaining
+
+
+def test_purge_max_rows_cap(client):
+    import database
+
+    for i in range(5):
+        database.log_event(recognized=False, confidence=0.0, system_action=f"e{i}")
+    database.purge_old_events(ttl_days=0, max_rows=3)
+    assert len(database.list_events(limit=100)) <= 3
+
+
+def test_metrics_endpoint_exposes_counters(client):
+    # Génère un peu de trafic d'abord.
+    client.get("/health")
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    body = resp.text
+    assert "http_requests_total" in body
+    assert "# TYPE http_requests_total counter" in body
+    assert "azure_requests_total" in body
+
+
+def test_metrics_count_increases(client):
+    import metrics
+
+    before = metrics.snapshot()["http_requests_total"]
+    client.get("/health")
+    after = metrics.snapshot()["http_requests_total"]
+    assert after > before
+
+
+def test_json_log_formatter_outputs_json():
+    import json
+    import logging
+
+    import main
+
+    rec = logging.LogRecord(
+        name="recognition.api", level=logging.INFO, pathname=__file__,
+        lineno=1, msg="hello %s", args=("world",), exc_info=None,
+    )
+    line = main._JsonLogFormatter().format(rec)
+    parsed = json.loads(line)
+    assert parsed["level"] == "INFO"
+    assert parsed["msg"] == "hello world"
+    assert parsed["logger"] == "recognition.api"
+
+
+def test_delete_reference_nulls_event_link(client, monkeypatch):
+    import database
+
+    fake = [{"faceRectangle": {"top": 1, "left": 2, "width": 3, "height": 4},
+             "faceAttributes": {"headPose": {"pitch": 0, "yaw": 0, "roll": 0}}}]
+    monkeypatch.setattr(recognition, "detect_faces", lambda b: fake)
+    monkeypatch.setattr(
+        recognition, "verify_against_references",
+        lambda path: (True, 0.91, {"id": 1, "name": "Alice"}),
+    )
+    # Crée une vraie référence puis un événement la référençant.
+    img = base64.b64decode(PIXEL_B64.split(",", 1)[1])
+    ref_id = client.post(
+        "/references",
+        data={"name": "Eve"},
+        files={"file": ("e.jpg", io.BytesIO(img), "image/jpeg")},
+    ).json()["id"]
+    database.log_event(recognized=True, confidence=0.9, reference_id=ref_id, name="Eve")
+
+    assert client.delete(f"/references/{ref_id}").status_code == 200
+    # Aucun événement ne doit encore pointer vers la référence supprimée.
+    with database.get_connection() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) AS n FROM recognition_events WHERE reference_id = ?",
+            (ref_id,),
+        ).fetchone()
+    assert rows["n"] == 0

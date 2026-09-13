@@ -3,6 +3,8 @@ import io
 import logging
 import os
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import requests
 
@@ -18,6 +20,10 @@ class EngineUnavailableError(RuntimeError):
 class DetectionError(RuntimeError):
     pass
 
+# Codes HTTP transitoires sur lesquels une nouvelle tentative a du sens.
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Exécuteur dédié pour borner la durée des vérifications DeepFace (R8).
+_verify_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="deepface")
 
 try:
     from deepface import DeepFace
@@ -28,6 +34,15 @@ try:
     from PIL import Image
 except ImportError:  # pragma: no cover
     Image = None
+
+
+def _metric_inc(name: str, value: float = 1.0) -> None:
+    """Incrémente une métrique (best-effort, import paresseux pour éviter un cycle)."""
+    try:
+        import metrics
+        metrics.inc(name, value)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def azure_headers() -> dict:
@@ -44,28 +59,43 @@ if settings.azure_configured():
     azure_service = AzureFaceService(settings.AZURE_FACE_ENDPOINT, settings.AZURE_FACE_KEY)
 
 def detect_faces(image_bytes: bytes) -> list[dict]:
-    """Détecte les visages via AzureFaceService."""
+    """Détecte les visages via Azure Face avec retries bornés."""
     if not azure_service:
         raise EngineUnavailableError("Azure Face n'est pas configuré.")
-    
-    try:
-        faces = azure_service.analyze_face_quality(image_bytes)
-        # On formate le retour pour qu'il inclue faceRectangle et faceAttributes pour la compatibilité avec main.py
-        results = []
-        for face in faces:
-            results.append({
-                "faceRectangle": face["bounding_box"],
-                "faceAttributes": {
-                    "headPose": face["quality_analysis"]["metrics"]["head_pose"] or {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
-                    "glasses": face["glasses"],
-                    "mask": face["mask"],
-                    "quality": face["quality_analysis"]
+
+    attempts = max(0, settings.AZURE_MAX_RETRIES) + 1
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        _metric_inc("azure_requests_total")
+        try:
+            faces = azure_service.analyze_face_quality(image_bytes)
+            return [
+                {
+                    "faceRectangle": face["bounding_box"],
+                    "faceAttributes": {
+                        "headPose": face["quality_analysis"]["metrics"]["head_pose"]
+                        or {"pitch": 0.0, "yaw": 0.0, "roll": 0.0},
+                        "glasses": face["glasses"],
+                        "mask": face["mask"],
+                        "quality": face["quality_analysis"],
+                    },
                 }
-            })
-        return results
-    except Exception as exc:
-        logger.error("Échec de la détection Azure (%s).", type(exc).__name__)
-        raise DetectionError("La détection Azure a échoué. Vérifiez la configuration et l'accès au service.") from exc
+                for face in faces
+            ]
+        except Exception as exc:  # SDK exceptions do not share one stable base class.
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            logger.warning(
+                "Erreur réseau Azure (tentative %d/%d) : %s", attempt + 1, attempts, exc
+            )
+        # Backoff exponentiel avant la prochaine tentative.
+        time.sleep(settings.AZURE_BACKOFF_BASE * (2 ** attempt))
+
+    _metric_inc("azure_failures_total")
+    if last_exc is not None:
+        raise DetectionError("La détection Azure a échoué. Vérifiez la configuration et l'accès au service.") from last_exc
+    raise DetectionError("La détection Azure a échoué.")
 
 
 def is_looking_direct(pitch: float, yaw: float) -> bool:
@@ -82,6 +112,32 @@ def is_clear_for_enrollment(pitch: float, yaw: float, roll: float) -> bool:
         and abs(yaw) <= settings.AUTO_ENROLL_YAW_MAX
         and abs(roll) <= settings.AUTO_ENROLL_ROLL_MAX
     )
+
+
+def _verify_with_timeout(ref_path: str, capture_path: str) -> dict:
+    """Exécute DeepFace.verify avec une borne de temps (évite un hang requête).
+
+    Lève `concurrent.futures.TimeoutError` si la vérification dépasse
+    `DEEPFACE_TIMEOUT`. NB : un thread déjà démarré ne peut pas être interrompu
+    de force (limite Python) — `future.cancel()` n'annule qu'une tâche encore en
+    file. Le pool est borné (`max_workers`) ; en cas de saturation durable,
+    réduire le nombre de références ou augmenter `DEEPFACE_TIMEOUT`. Une vraie
+    interruption nécessiterait un `ProcessPoolExecutor` killable (compromis :
+    coût de (re)chargement des modèles par process).
+    """
+    future = _verify_executor.submit(
+        DeepFace.verify,
+        img1_path=ref_path,
+        img2_path=capture_path,
+        model_name=settings.DEEPFACE_MODEL,
+        enforce_detection=False,
+    )
+    try:
+        return future.result(timeout=settings.DEEPFACE_TIMEOUT)
+    except FuturesTimeoutError:
+        # Libère le slot si la tâche n'a pas encore démarré.
+        future.cancel()
+        raise
 
 
 def verify_against_references(capture_path: str) -> tuple[bool, float, dict | None]:
@@ -104,12 +160,14 @@ def verify_against_references(capture_path: str) -> tuple[bool, float, dict | No
         if not os.path.exists(ref["image_path"]):
             continue
         try:
-            result = DeepFace.verify(
-                img1_path=ref["image_path"],
-                img2_path=capture_path,
-                model_name=settings.DEEPFACE_MODEL,
-                enforce_detection=False,
+            result = _verify_with_timeout(ref["image_path"], capture_path)
+        except FuturesTimeoutError:
+            _metric_inc("deepface_timeouts_total")
+            logger.error(
+                "DeepFace : délai dépassé (%.1fs) pour la référence %s.",
+                settings.DEEPFACE_TIMEOUT, ref["id"],
             )
+            continue
         except Exception as exc:  # noqa: BLE001
             logger.error("Échec DeepFace pour la référence %s (%s).", ref["id"], type(exc).__name__)
             continue

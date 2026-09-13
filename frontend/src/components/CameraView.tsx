@@ -76,7 +76,7 @@ export default function CameraView({
         )}
 
         {cameraSize.width > 0 &&
-          faces.map((face, index) => {
+          faces.map((face) => {
             const r = face.faceRectangle;
             const left = (r.left / cameraSize.width) * 100;
             const top = (r.top / cameraSize.height) * 100;
@@ -88,9 +88,13 @@ export default function CameraView({
             const shadow = face.recognized
               ? "shadow-[0_0_15px_rgba(16,185,129,0.5)]"
               : "shadow-[0_0_15px_rgba(239,68,68,0.5)]";
+            // Clé stable basée sur la position du visage plutôt que l'index :
+            // évite que React réassocie les overlays au mauvais visage quand
+            // l'ordre du tableau change d'une frame à l'autre.
+            const key = `${r.left}-${r.top}-${r.width}-${r.height}`;
             return (
               <div
-                key={`face-${index}`}
+                key={key}
                 className={`pointer-events-none absolute rounded-lg border-2 transition-all duration-300 ${border} ${shadow}`}
                 style={{
                   left: `${left}%`,

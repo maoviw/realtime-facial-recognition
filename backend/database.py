@@ -2,7 +2,7 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import settings
 
@@ -61,6 +61,16 @@ def init_db() -> None:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(references_face)")}
         if "auto" not in cols:
             conn.execute("ALTER TABLE references_face ADD COLUMN auto INTEGER NOT NULL DEFAULT 0")
+
+        # Index sur les colonnes fréquemment filtrées/triées (R11).
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_events_created_at
+                ON recognition_events (created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_reference_id
+                ON recognition_events (reference_id);
+            """
+        )
 
 
 def _now() -> str:
@@ -148,6 +158,11 @@ def delete_reference(ref_id: int) -> bool:
         return False
     with get_connection() as conn:
         conn.execute("DELETE FROM references_face WHERE id = ?", (ref_id,))
+        # Évite des événements pointant vers une référence supprimée (intégrité, R11).
+        conn.execute(
+            "UPDATE recognition_events SET reference_id = NULL WHERE reference_id = ?",
+            (ref_id,),
+        )
     # Suppression du fichier image associé
     try:
         if ref["image_path"] and os.path.exists(ref["image_path"]):
@@ -200,3 +215,35 @@ def list_events(limit: int = 50) -> list[dict]:
         event["recognized"] = bool(event["recognized"])
         events.append(event)
     return events
+
+
+def purge_old_events(ttl_days: int | None = None, max_rows: int | None = None) -> int:
+    """Purge l'historique : supprime les événements trop anciens et/ou au-delà
+    d'un plafond de lignes. Retourne le nombre de lignes supprimées.
+
+    - `ttl_days` (défaut `HISTORY_TTL_DAYS`) : supprime les événements plus
+      vieux que N jours. 0 désactive la purge par âge.
+    - `max_rows` (défaut `HISTORY_MAX_ROWS`) : ne conserve que les N plus
+      récents. 0 désactive le plafond.
+    """
+    ttl_days = settings.HISTORY_TTL_DAYS if ttl_days is None else ttl_days
+    max_rows = settings.HISTORY_MAX_ROWS if max_rows is None else max_rows
+    deleted = 0
+    with get_connection() as conn:
+        if ttl_days and ttl_days > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).isoformat()
+            cur = conn.execute(
+                "DELETE FROM recognition_events WHERE created_at < ?", (cutoff,)
+            )
+            deleted += cur.rowcount or 0
+        if max_rows and max_rows > 0:
+            cur = conn.execute(
+                """DELETE FROM recognition_events
+                   WHERE id NOT IN (
+                       SELECT id FROM recognition_events
+                       ORDER BY created_at DESC LIMIT ?
+                   )""",
+                (max_rows,),
+            )
+            deleted += cur.rowcount or 0
+    return deleted

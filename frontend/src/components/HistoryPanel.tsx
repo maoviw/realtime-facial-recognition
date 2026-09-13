@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { History } from "lucide-react";
 import type { RecognitionEvent } from "@/lib/types";
 
@@ -17,6 +18,13 @@ export default function HistoryPanel({
 }: {
   events: RecognitionEvent[];
 }) {
+  // Pré-calcule le libellé temporel par événement ; ne se recalcule que si la
+  // liste change (et non à chaque re-render du tableau de bord parent).
+  const rows = useMemo(
+    () => events.map((e) => ({ event: e, ago: timeAgo(e.created_at) })),
+    [events],
+  );
+
   if (events.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-4 text-sm text-slate-500">
@@ -28,7 +36,7 @@ export default function HistoryPanel({
 
   return (
     <ul className="flex flex-col gap-2 overflow-y-auto pr-2 custom-scrollbar">
-      {events.map((e) => (
+      {rows.map(({ event: e, ago }) => (
         <li
           key={e.id}
           className="flex items-center justify-between rounded-lg border border-slate-700/50 bg-slate-800/40 px-3 py-2 text-xs"
@@ -48,7 +56,7 @@ export default function HistoryPanel({
             </span>
           </div>
           <time className="font-mono text-slate-500" dateTime={e.created_at}>
-            {timeAgo(e.created_at)}
+            {ago}
           </time>
         </li>
       ))}

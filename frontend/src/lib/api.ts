@@ -5,8 +5,14 @@ import type {
   ReferenceFace,
 } from "./types";
 
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+// Par défaut, les appels passent par le proxy serveur same-origin
+// (`/api/proxy/*`, cf. src/app/api/proxy/[...path]/route.ts) qui injecte la clé
+// API côté serveur (R6) : la vraie clé ne touche jamais le navigateur.
+// Pour cibler directement le backend (dev/legacy), définir NEXT_PUBLIC_BACKEND_URL.
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "/api/proxy";
+// N'est utilisé qu'en mode direct (NEXT_PUBLIC_BACKEND_URL défini). En mode
+// proxy, laisser vide : le serveur ajoute la clé. AVERTISSEMENT : toute variable
+// NEXT_PUBLIC_* est embarquée dans le bundle client (visible en DevTools).
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -39,6 +45,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
       throw new Error("Délai d'attente dépassé. Le backend répond-il ?");
+    }
+    // Échec réseau (backend injoignable, CORS, DNS) : `fetch` rejette avec un
+    // TypeError. On le convertit en message clair plutôt que de propager
+    // « Failed to fetch » brut à l'UI.
+    if (err instanceof TypeError) {
+      throw new Error("Backend injoignable. Vérifiez la connexion.");
     }
     throw err;
   } finally {

@@ -38,6 +38,9 @@ class Settings:
     AZURE_FACE_ENDPOINT: str = os.getenv("AZURE_FACE_ENDPOINT", "")
     AZURE_FACE_KEY: str = os.getenv("AZURE_FACE_KEY", "")
     AZURE_TIMEOUT: float = _get_float("AZURE_TIMEOUT", 10.0)
+    # Résilience Azure : retries avec backoff exponentiel sur erreurs transitoires.
+    AZURE_MAX_RETRIES: int = _get_int("AZURE_MAX_RETRIES", 2)
+    AZURE_BACKOFF_BASE: float = _get_float("AZURE_BACKOFF_BASE", 0.5)
 
     # --- Stockage ---
     DATA_DIR: str = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
@@ -50,6 +53,8 @@ class Settings:
     HEADPOSE_YAW_MAX: float = _get_float("HEADPOSE_YAW_MAX", 15.0)
     # Modèle DeepFace
     DEEPFACE_MODEL: str = os.getenv("DEEPFACE_MODEL", "VGG-Face")
+    # Garde-fou anti-blocage : durée max d'une vérification DeepFace (secondes).
+    DEEPFACE_TIMEOUT: float = _get_float("DEEPFACE_TIMEOUT", 20.0)
 
     # --- Auto-enrôlement ---
     # Quand un visage net (angle franc) n'est pas reconnu, il est automatiquement
@@ -82,6 +87,24 @@ class Settings:
     MAX_UPLOAD_BYTES: int = _get_int("MAX_UPLOAD_BYTES", 8 * 1024 * 1024)  # 8 Mio
     HISTORY_LIMIT_MAX: int = _get_int("HISTORY_LIMIT_MAX", 200)
 
+    # --- Rétention de l'historique (anti-croissance illimitée) ---
+    # Purge des événements plus vieux que N jours (0 = pas de purge par âge).
+    HISTORY_TTL_DAYS: int = _get_int("HISTORY_TTL_DAYS", 30)
+    # Plafond dur du nombre de lignes conservées (0 = illimité).
+    HISTORY_MAX_ROWS: int = _get_int("HISTORY_MAX_ROWS", 10000)
+
+    # --- Limitation de débit (anti-DoS / anti-brute-force) ---
+    # Format slowapi : "<nombre>/<période>" (ex. "60/minute", "5/second").
+    # Vide pour désactiver.
+    RATE_LIMIT: str = os.getenv("RATE_LIMIT", "60/minute")
+
+    # --- Journalisation / conformité ---
+    # Masque les noms (PII) dans les logs ; désactiver uniquement en dev.
+    LOG_MASK_PII: bool = _get_bool("LOG_MASK_PII", True)
+    # Format des logs : "text" (lisible) ou "json" (structuré, pour ingestion).
+    LOG_FORMAT: str = os.getenv("LOG_FORMAT", "text").lower()
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
     @classmethod
     def azure_configured(cls) -> bool:
         return bool(cls.AZURE_FACE_ENDPOINT and cls.AZURE_FACE_KEY)
@@ -89,6 +112,20 @@ class Settings:
     @classmethod
     def is_production(cls) -> bool:
         return cls.ENV in ("production", "prod")
+
+
+def mask_name(name: str | None) -> str:
+    """Masque un nom pour la journalisation (conformité PII).
+
+    Conserve la première lettre et la longueur (ex. « Alice » -> « A**** »),
+    sauf si LOG_MASK_PII est désactivé (renvoie alors le nom en clair).
+    """
+    label = name or "Inconnu"
+    if not settings.LOG_MASK_PII:
+        return label
+    if len(label) <= 1:
+        return "*"
+    return label[0] + "*" * (len(label) - 1)
 
 
 settings = Settings()

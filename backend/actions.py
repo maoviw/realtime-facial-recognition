@@ -14,7 +14,7 @@ import subprocess
 
 import requests
 
-from config import settings
+from config import mask_name, settings
 
 logger = logging.getLogger("recognition.actions")
 
@@ -22,7 +22,9 @@ logger = logging.getLogger("recognition.actions")
 def trigger_action(name: str | None, confidence: float) -> str:
     """Déclenche l'action configurée. Retourne un libellé décrivant ce qui a été fait."""
     label = name or "Inconnu"
-    logger.info("Visage reconnu: %s (confiance=%.2f)", label, confidence)
+    # Le nom est masqué dans les logs (PII) ; la valeur en clair reste utilisée
+    # pour les actions (commande/webhook) déclenchées localement.
+    logger.info("Visage reconnu: %s (confiance=%.2f)", mask_name(label), confidence)
 
     action = settings.RECOGNITION_ACTION
 

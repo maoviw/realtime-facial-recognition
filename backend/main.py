@@ -9,24 +9,62 @@ Endpoints :
   GET  /history             -> historique des reconnaissances
   GET  /settings            -> seuils et configuration courante
 """
+import asyncio
 import base64
 import io
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from threading import Lock
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 
 import database
+import metrics
 import recognition
 from actions import trigger_action
-from config import settings
+from config import mask_name, settings
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+class _JsonLogFormatter(logging.Formatter):
+    """Formate chaque enregistrement de log en une ligne JSON (ingestion)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _configure_logging() -> None:
+    handler = logging.StreamHandler()
+    if settings.LOG_FORMAT == "json":
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
+
+
+_configure_logging()
 logger = logging.getLogger("recognition.api")
 _analysis_lock = Lock()
 
@@ -46,6 +84,18 @@ def _looks_like_image(data: bytes) -> bool:
     return any(data.startswith(sig) for sig in _IMAGE_MAGIC)
 
 
+async def _periodic_purge(interval_seconds: float = 6 * 3600) -> None:
+    """Tâche d'arrière-plan : purge périodiquement l'historique (R10)."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            removed = await asyncio.to_thread(database.purge_old_events)
+            if removed:
+                logger.info("Purge historique : %d événement(s) supprimé(s).", removed)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Échec de la purge d'historique : %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if settings.is_production() and not settings.API_KEY:
@@ -58,18 +108,85 @@ async def lifespan(app: FastAPI):
         logger.warning("Clés Azure manquantes : la détection de visages échouera.")
     if recognition.DeepFace is None:
         logger.warning("DeepFace non installé : la vérification 1:1 échouera (pip install deepface).")
+    # Purge au démarrage, puis périodiquement en arrière-plan.
+    removed = database.purge_old_events()
+    if removed:
+        logger.info("Purge historique au démarrage : %d événement(s) supprimé(s).", removed)
+    purge_task = asyncio.create_task(_periodic_purge())
     logger.info("Démarrage OK — %d référence(s) enrôlée(s).", len(database.list_references()))
-    yield
+    try:
+        yield
+    finally:
+        purge_task.cancel()
+        try:
+            await purge_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Real-time Facial Recognition API", version="2.0.0", lifespan=lifespan)
+
+# --- Limitation de débit (anti-DoS / anti-brute-force) ---
+# Clé = adresse IP du client. La limite par défaut s'applique à tous les
+# endpoints décorés ; configurable via RATE_LIMIT (vide = désactivé).
+_rate_limits = [settings.RATE_LIMIT] if settings.RATE_LIMIT else []
+limiter = Limiter(key_func=get_remote_address, default_limits=_rate_limits)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Trop de requêtes. Réessayez plus tard."},
+    )
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Compte les requêtes, les erreurs et la latence (observabilité, R13)."""
+
+    async def dispatch(self, request: Request, call_next):
+        metrics.inc("http_requests_total")
+        with metrics.timer():
+            response = await call_next(request)
+        if response.status_code >= 500:
+            metrics.inc("http_responses_5xx_total")
+        elif response.status_code >= 400:
+            metrics.inc("http_responses_4xx_total")
+        return response
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Ajoute des en-têtes de sécurité à chaque réponse (API uniquement)."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'")
+        if settings.is_production():
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+            )
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(MetricsMiddleware)
+
+# Applique la limite par défaut à toutes les routes (si RATE_LIMIT défini).
+if _rate_limits:
+    app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["x-api-key", "content-type"],
 )
 
 
@@ -105,7 +222,8 @@ def _maybe_auto_enroll(
     image_path = recognition.save_reference_image(image_bytes, rect)
     label = database.next_auto_label()
     ref = database.add_reference(label, image_path, auto=True)
-    logger.info("Auto-enrôlement : nouvelle référence « %s » (id=%s).", label, ref["id"])
+    metrics.inc("auto_enrollments_total")
+    logger.info("Auto-enrôlement : nouvelle référence « %s » (id=%s).", mask_name(label), ref["id"])
     return ref
 
 
@@ -118,6 +236,12 @@ async def health() -> dict:
         "references": len(database.list_references()),
         "recognition_action": settings.RECOGNITION_ACTION,
     }
+
+
+@app.get("/metrics")
+async def get_metrics() -> PlainTextResponse:
+    """Métriques d'exploitation au format Prometheus (text/plain)."""
+    return PlainTextResponse(metrics.render_prometheus())
 
 
 @app.get("/settings")
@@ -148,13 +272,18 @@ def _decode_image(data_url: str) -> bytes:
 
 
 @app.post("/analyze-face", dependencies=[Depends(require_api_key)])
-def analyze_face(payload: ImagePayload) -> dict:
+async def analyze_face(payload: ImagePayload) -> dict:
     if not _analysis_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=429,
             detail="Une analyse est déjà en cours. Réessayez après sa fin.",
             headers={"Retry-After": "1"},
         )
+
+    return await asyncio.to_thread(_analyze_face_locked, payload)
+
+
+def _analyze_face_locked(payload: ImagePayload) -> dict:
     try:
         return _analyze_face(payload)
     finally:
@@ -164,6 +293,8 @@ def analyze_face(payload: ImagePayload) -> dict:
 def _analyze_face(payload: ImagePayload) -> dict:
     image_bytes = _decode_image(payload.image)
 
+    # Les compteurs Azure (tentatives + échec final) sont gérés dans
+    # recognition.detect_faces pour refléter chaque tentative de retry.
     try:
         detected = recognition.detect_faces(image_bytes)
     except recognition.EngineUnavailableError as exc:
@@ -215,8 +346,11 @@ def _analyze_face(payload: ImagePayload) -> dict:
             except recognition.EngineUnavailableError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             finally:
-                if os.path.exists(face_path):
-                    os.remove(face_path)
+                try:
+                    if os.path.exists(face_path):
+                        os.remove(face_path)
+                except OSError as exc:
+                    logger.warning("Nettoyage capture temporaire impossible : %s", exc)
 
             if recognized and matched:
                 name = matched["name"]
@@ -305,7 +439,12 @@ async def get_references() -> dict:
 
 @app.patch("/references/{ref_id}", dependencies=[Depends(require_api_key)])
 async def rename_reference(ref_id: int, payload: RenamePayload) -> dict:
-    updated = database.update_reference_name(ref_id, payload.name.strip())
+    # `min_length` Pydantic s'applique avant strip : rejette un nom uniquement
+    # composé d'espaces (ex. "   ") qui deviendrait vide après nettoyage.
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Le nom ne peut pas être vide.")
+    updated = database.update_reference_name(ref_id, name)
     if updated is None:
         raise HTTPException(status_code=404, detail="Référence introuvable.")
     return updated
@@ -316,7 +455,9 @@ async def get_reference_image(ref_id: int) -> FileResponse:
     ref = database.get_reference(ref_id)
     if not ref or not ref.get("image_path") or not os.path.exists(ref["image_path"]):
         raise HTTPException(status_code=404, detail="Image introuvable.")
-    return FileResponse(ref["image_path"], media_type="image/jpeg")
+    # Laisse Starlette déduire le type via l'extension (jpg/png/webp/bmp) plutôt
+    # que forcer image/jpeg : les références manuelles ne sont pas toutes en JPEG.
+    return FileResponse(ref["image_path"])
 
 
 @app.delete("/references/{ref_id}", dependencies=[Depends(require_api_key)])
